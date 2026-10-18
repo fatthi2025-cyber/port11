@@ -1,5 +1,5 @@
 """
-Sarafees - سرافيس: تطبيق ركاب وسائقين (Dash + Leaflet)  ← نسخة معدّلة من f.py
+حي بطن الهوي - سرفيس: تطبيق ركاب وسائقين (Dash + Leaflet)  ← نسخة معدّلة من f.py
 
 التشغيل محلياً:
     pip install -r requirements.txt
@@ -11,6 +11,7 @@ Sarafees - سرافيس: تطبيق ركاب وسائقين (Dash + Leaflet)  �
 
 متغيرات البيئة (اختيارية):
     DRIVER_CODES     رموز السائقين مفصولة بفاصلة، مثال: 4821,7730,1956   (لكل رمز حافلة)
+    ADMIN_CODE       رمز دخول لوحة الإدارة (الافتراضي: 2468؛ غيّره قبل النشر)
     REFRESH_SECONDS  فترة تحديث الدبابيس بالثواني (الافتراضي 20)
 
 ملاحظة: تحديد الموقع في المتصفح يعمل على https أو localhost فقط (Render يوفر https).
@@ -24,7 +25,7 @@ import uuid
 
 import dash
 import dash_leaflet as dl
-from dash import Input, Output, State, ctx, dcc, html, no_update
+from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 
 # ================================ الإعدادات ================================
 CENTER = [31.9038, 35.2070]      # مركز الخريطة الابتدائي (كما في الكود الأصلي)
@@ -34,15 +35,17 @@ PASSENGER_TTL = 15 * 60          # ينتهي طلب الراكب تلقائيا
 BUS_TTL = 120                    # حافلة لم تصل منها إشارة خلال دقيقتين تُخفى
 LOAD_RADIUS = 0.006              # عند «تحميل راكب» يُحذف أقرب طلب ضمن ≈ 650 م
 DRIVER_CODES = [c.strip() for c in os.environ.get("DRIVER_CODES", "1234,5678,9999").split(",") if c.strip()]
+ADMIN_CODE = os.environ.get("ADMIN_CODE", "2468").strip()
 # ===========================================================================
 
 lock = threading.Lock()
 passengers = {}                  # معرّف المتصفح -> {name, lat, lon, t}
+activity_log = []                # سجل آخر الحركات في العملية الحالية
 buses = {code: {"label": f"حافلة {i}", "lat": None, "lon": None, "riders": 0, "seen": 0.0}
          for i, code in enumerate(DRIVER_CODES, 1)}
 
 app = dash.Dash(
-    __name__, suppress_callback_exceptions=True, title="Sarafees",
+    __name__, suppress_callback_exceptions=True, title=" سرفيس حي بطن الهوى",
     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
 )
 server = app.server
@@ -61,8 +64,17 @@ app.index_string = """<!DOCTYPE html>
   .title{text-align:center;margin:16px 8px 8px}
   .card{max-width:460px;margin:14px auto;padding:16px;background:#fff;border-radius:14px;
         box-shadow:0 1px 6px rgba(0,0,0,.12);box-sizing:border-box;width:calc(100% - 24px)}
-  .field{width:100%;box-sizing:border-box;padding:12px;font-size:17px;border:1px solid #ccc;
-         border-radius:10px;margin:6px 0 10px}
+  .field{
+width:100%;
+box-sizing:border-box;
+padding:12px;
+height:50px;
+line-height:24px;
+font-size:15px;
+border:1px solid #ccc;
+border-radius:10px;
+margin:6px 0 10px;
+}
   .btn{display:block;width:100%;padding:14px;font-size:18px;border:none;border-radius:10px;
        color:#fff;margin-top:10px;cursor:pointer;font-family:inherit}
   .btn:active{opacity:.8}
@@ -70,7 +82,8 @@ app.index_string = """<!DOCTYPE html>
   .purple{background:#5322e6}.orange{background:#ef6c00}
   .status{text-align:center;font-weight:bold;margin-top:10px;min-height:20px}
   .err{color:#c0392b}
-  .mapwrap{width:calc(100% - 24px);max-width:1000px;margin:12px auto 24px;border-radius:12px;overflow:hidden}
+  .mapwrap{width:calc(100% - 16px);max-width:1400px;margin:8px auto 16px;border-radius:12px;overflow:hidden}
+  .passenger-card{max-width:760px;margin:8px auto;padding:10px 16px}
   .leaflet-container{direction:ltr}
   .row{display:flex;gap:10px}.row .btn{margin-top:0}
   .big{font-size:30px;font-weight:bold;text-align:center;margin:6px 0}
@@ -100,6 +113,11 @@ def prune():
         del passengers[pid]
 
 
+def log_activity(message):
+    activity_log.insert(0, {"time": stamp(), "message": message})
+    del activity_log[200:]
+
+
 def circle(lat, lon, color, radius, tip):
     return dl.CircleMarker(center=[lat, lon], radius=radius, color=color, fillColor=color, fillOpacity=0.8,
                            children=[dl.Tooltip(tip), dl.Popup(tip)])
@@ -113,8 +131,10 @@ def bus_of(drv):
 
 def navbar(right=None):
     return html.Div([
-        html.Div("🚌 Sarafees", className="brand"),
-        right or dcc.Link("👨‍✈️ دخول السائق", href="/driver-login", className="pill"),
+        html.Div("🚌  سرفيس حي بطن الهوي", className="brand"),
+        html.Div([dcc.Link("🏠 الرئيسية", href="/", className="pill"),
+                  right or dcc.Link("👨‍✈️ دخول السائق", href="/driver-login", className="pill"),
+                  dcc.Link("🛠 الإدارة", href="/admin", className="pill")], className="row"),
     ], className="navbar")
 
 
@@ -122,7 +142,12 @@ def navbar(right=None):
 def passenger_layout():
     return html.Div([
         navbar(),
-        html.H2("واجهة الراكب - طلب سرافيس", className="title"),
+        html.H2("واجهة الراكب - طلب سرفيس", className="title"),
+        html.H4("🚌 الحافلات المتاحة حالياً", className="title"),
+        html.Div(id="bus-info", className="status"),
+        html.Div(dl.Map([dl.TileLayer(), dl.LayerGroup(id="buses-markers")], id="passenger-map",
+                        center=CENTER, zoom=14, style={"height": "68vh", "minHeight": "420px"}),
+                 className="mapwrap"),
         html.Div([
             html.Label("اسم الراكب:"),
             dcc.Input(id="passenger-name", type="text", placeholder="أدخل اسمك هنا", className="field",
@@ -132,12 +157,8 @@ def passenger_layout():
             html.Button("✅ إرسال الطلب للسائقين", id="submit-btn", n_clicks=0, className="btn green"),
             html.Button("❌ إلغاء الطلب", id="cancel-btn", n_clicks=0, className="btn red"),
             html.Div(id="submit-output", className="status"),
-        ], className="card"),
-        html.H4("🚌 الحافلات المتاحة حالياً", className="title"),
-        html.Div(id="bus-info", className="status"),
-        html.Div(dl.Map([dl.TileLayer(), dl.LayerGroup(id="buses-markers")], id="passenger-map",
-                        center=CENTER, zoom=14, style={"height": "55vh", "minHeight": "320px"}),
-                 className="mapwrap"),
+            html.Div(id="request-response", className="status"),
+        ], className="card passenger-card"),
         dcc.Interval(id="buses-interval", interval=REFRESH_SECONDS * 1000, n_intervals=0),
     ])
 
@@ -154,6 +175,14 @@ def driver_login_layout():
             html.Div(id="login-output", className="status err"),
         ], className="card"),
     ])
+
+
+def admin_layout():
+    return html.Div([navbar(), html.H2("🛠 متابعة الطلبات والحركات", className="title"),
+        html.Div([dcc.Input(id="admin-code", type="password", placeholder="رمز الإدارة", className="field"),
+                  html.Button("دخول الإدارة", id="admin-login", n_clicks=0, className="btn purple"),
+                  html.Div(id="admin-login-output", className="status err")], className="card"),
+        html.Div(id="admin-board"), dcc.Interval(id="admin-interval", interval=REFRESH_SECONDS * 1000, n_intervals=0)])
 
 
 # ================================ واجهة السائق ================================
@@ -192,6 +221,8 @@ app.layout = html.Div([
 
 @app.callback(Output("page-content", "children"), Input("url", "pathname"), Input("driver", "data"))
 def display_page(path, drv):
+    if path == "/admin":
+        return admin_layout()
     if path and path.startswith("/driver"):
         bus = bus_of(drv)
         return driver_map_layout(bus) if bus else driver_login_layout()   # لا دخول للخريطة بدون رمز
@@ -285,7 +316,10 @@ def add_passenger(_n, pid, name, pos):
         return "تعذّر تحديد هويتك، أعد تحميل الصفحة"
     with lock:
         existed = pid in passengers
-        passengers[pid] = {"name": name, "lat": pos["lat"], "lon": pos["lon"], "t": time.time()}
+        old = passengers.get(pid, {})
+        passengers[pid] = {"name": name, "lat": pos["lat"], "lon": pos["lon"], "t": time.time(),
+                           "status": old.get("status", "pending"), "eta": old.get("eta", "")}
+        log_activity(f"طلب {'محدّث' if existed else 'جديد'}: {name}")
     return f"{'تم تحديث موقعك' if existed else 'تم إرسال الطلب'} ✓ ({stamp()})"
 
 
@@ -293,12 +327,14 @@ def add_passenger(_n, pid, name, pos):
               Input("cancel-btn", "n_clicks"), State("pid", "data"), prevent_initial_call=True)
 def cancel_request(_n, pid):
     with lock:
-        found = passengers.pop(pid, None) is not None
+        removed = passengers.pop(pid, None)
+        found = removed is not None
+        if removed: log_activity(f"إلغاء طلب: {removed['name']}")
     return f"تم إلغاء الطلب ✓ ({stamp()})" if found else "لا يوجد طلب لإلغائه"
 
 
 # ================================ خريطة الحافلات للراكب ================================
-@app.callback(Output("buses-markers", "children"), Output("bus-info", "children"),
+@app.callback(Output("buses-markers", "children"), Output("bus-info", "children"), Output("request-response", "children"),
               Input("buses-interval", "n_intervals"), Input("submit-output", "children"), Input("pid", "data"))
 def update_buses(_n, _s, pid):
     now = time.time()
@@ -316,7 +352,57 @@ def update_buses(_n, _s, pid):
         markers.append(circle(me["lat"], me["lon"], "#1565c0", 10, "موقعك (طلبك مسجّل)"))
     info = (f"حافلات تعمل الآن: {len(live)} | آخر تحديث {stamp()}" if live
             else f"لا توجد حافلات نشطة حالياً | آخر تحديث {stamp()}")
-    return markers, info
+    response = ""
+    if me:
+        if me.get("status") == "available":
+            response = f"✅ الإدارة: الحافلة متوفرة حالياً{(' — الوقت المتوقع: ' + str(me['eta'])) if me.get('eta') else ''}"
+        elif me.get("status") == "unavailable":
+            response = "⏳ الإدارة: الخدمة غير متوفرة حالياً"
+        else:
+            response = "📨 طلبك قيد المراجعة لدى الإدارة"
+    return markers, info, response
+
+
+@app.callback(Output("admin-login-output", "children"), Output("admin-board", "children"),
+              Input("admin-login", "n_clicks"), Input("admin-interval", "n_intervals"),
+              State("admin-code", "value"))
+def admin_dashboard(_click, _tick, code):
+    if not code or not hmac.compare_digest(str(code), ADMIN_CODE):
+        return ("أدخل رمز الإدارة الصحيح" if _click else ""), ""
+    with lock:
+        prune()
+        items = [(pid, dict(p)) for pid, p in passengers.items()]
+        history = [html.Div(f"{e['time']} — {e['message']}") for e in activity_log[:50]]
+    rows = []
+    for pid, p in items:
+        rows.append(html.Div([html.B(p["name"]), html.Span(f" — {stamp()} — الحالة: {p.get('status','pending')}"),
+            html.Div(f"الموقع: {p['lat']:.5f}, {p['lon']:.5f}"),
+            dcc.Input(id={"type":"eta", "pid":pid}, type="text", placeholder="الوقت المتوقع (مثال: 15 دقيقة)", value=p.get("eta",""), className="field"),
+            html.Button("✅ متوفر", id={"type":"available", "pid":pid}, n_clicks=0, className="btn green"),
+            html.Button("⏳ غير متوفر", id={"type":"unavailable", "pid":pid}, n_clicks=0, className="btn red")], className="card"))
+    content = [html.H3("الطلبات النشطة", className="title"), *rows,
+               html.Div([html.H3("سجل الحركات", className="title"), *(history or [html.Div("لا توجد حركات مسجلة")])], className="card")]
+    return "", html.Div(content)
+
+
+@app.callback(Output("admin-board", "children", allow_duplicate=True),
+              Input({"type":"available", "pid":dash.ALL}, "n_clicks"),
+              Input({"type":"unavailable", "pid":dash.ALL}, "n_clicks"),
+              State({"type":"eta", "pid":dash.ALL}, "value"), State({"type":"eta", "pid":dash.ALL}, "id"),
+              State("admin-code", "value"), prevent_initial_call=True)
+def update_request_status(_yes, _no, etas, eta_ids, code):
+    if not code or not hmac.compare_digest(str(code), ADMIN_CODE): return no_update
+    trig = ctx.triggered_id
+    if not isinstance(trig, dict): return no_update
+    pid = trig.get("pid")
+    with lock:
+        p = passengers.get(pid)
+        if p:
+            p["status"] = "available" if trig["type"] == "available" else "unavailable"
+            if trig["type"] == "available":
+                p["eta"] = next((v for v, i in zip(etas or [], eta_ids or []) if i.get("pid") == pid), "")
+            log_activity(f"رد الإدارة على {p['name']}: {'متوفر' if p['status'] == 'available' else 'غير متوفر'}" + (f"، الوقت المتوقع {p['eta']}" if p.get("eta") else ""))
+    return admin_dashboard(1, 0, code)[1]
 
 
 # ================================ GPS السائق (clientside) ================================
@@ -358,6 +444,7 @@ def driver_view(pos, _b, _a, drv):
                 viewport = {"center": [pos["lat"], pos["lon"]], "zoom": 15, "transition": "flyTo"}
         elif trig == "board-btn" and bus["riders"] < CAPACITY:
             bus["riders"] += 1
+            log_activity(f"{bus['label']}: تحميل راكب (الإجمالي {bus['riders']})")
             if bus["lat"] is not None and passengers:      # أقرب طلب قريب يُعتبر محمّلاً
                 here = (bus["lat"], bus["lon"])
                 pid, p = min(passengers.items(), key=lambda kv: dist(here, (kv[1]["lat"], kv[1]["lon"])))
@@ -365,6 +452,7 @@ def driver_view(pos, _b, _a, drv):
                     del passengers[pid]
         elif trig == "alight-btn" and bus["riders"] > 0:
             bus["riders"] -= 1
+            log_activity(f"{bus['label']}: تنزيل راكب (الإجمالي {bus['riders']})")
         prune()
         plist = [dict(p) for p in passengers.values()]
         riders, mine = bus["riders"], (bus["lat"], bus["lon"])
